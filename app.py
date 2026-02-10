@@ -9,85 +9,76 @@ import re
 import tempfile
 import os
 import pandas as pd
+from transformers import pipeline
 
-st.set_page_config(page_title="Offline Invoice VAT Extractor v2", layout="wide")
-st.title("🧾 Offline Invoice → VAT + Total Extractor (Improved)")
-st.caption("100% local/offline: No API keys. Enhanced regex for your examples + better fallback.")
+# Disable decompression bomb check
+Image.MAX_IMAGE_PIXELS = None
+
+st.set_page_config(page_title="AI Invoice VAT Extractor", layout="wide")
+st.title("🧾 AI-Powered Invoice → VAT + Total Extractor")
+st.caption("Uses free local AI (LayoutLM) for extraction. No API keys. Works on PDFs/images.")
+
+# Load AI model (caches after first load)
+@st.cache_resource
+def load_model():
+    return pipeline("document-question-answering", model="impira/layoutlm-document-qa")
+
+nlp = load_model()
 
 def preprocess_image(img):
-    img = img.convert("L")  # grayscale
+    img = img.convert("L")
     img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Contrast(img).enhance(2.0)  # Increased contrast
-    img = ImageEnhance.Sharpness(img).enhance(1.5)  # Added sharpness
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    img = ImageEnhance.Sharpness(img).enhance(1.5)
     open_cv = np.array(img)
-    open_cv = cv2.medianBlur(open_cv, 3)  # Noise reduction
+    open_cv = cv2.medianBlur(open_cv, 3)
     open_cv = cv2.threshold(open_cv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     return Image.fromarray(open_cv)
 
-def extract_text(file_bytes, filename):
+def get_image_from_file(file_bytes, filename):
     suffix = os.path.splitext(filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
-    text = ""
+    image = None
     try:
         if suffix == ".pdf":
-            reader = PdfReader(tmp_path)
-            for page in reader.pages:
-                page_text = page.extract_text() or ""
-                text += page_text + "\n"
-            if len(text.strip()) < 50:  # Likely scanned PDF
-                images = convert_from_path(tmp_path, dpi=500)  # Higher DPI for better OCR
-                for img in images:
-                    proc = preprocess_image(img)
-                    text += pytesseract.image_to_string(proc, lang="eng", config='--psm 6') + "\n"  # PSM 6 for better layout
-        else:  # image
+            # Convert PDF to image (first page only to avoid large files)
+            images = convert_from_path(tmp_path, dpi=300, first_page=1, last_page=1)
+            image = preprocess_image(images[0])
+        else:
             img = Image.open(tmp_path)
-            proc = preprocess_image(img)
-            text = pytesseract.image_to_string(proc, lang="eng", config='--psm 6')
+            image = preprocess_image(img)
     finally:
         os.unlink(tmp_path)
-    return text.strip()
+    return image
 
-def parse_invoice(text):
-    # Improved heuristic regex for South African invoices (based on your examples)
-    total_patterns = [
-        r'Total Payable:\s*R\s*([\d.,]+)',  # Amazon
-        r'Total Amount\s*([\d.,]+)',        # Brights
-        r'Grand Total:\s*R\s*([\d.,]+)',    # NATEC/General
-        r'Total Incl\s*([\d.,]+)',          # NATEC
-        r'Total\s+R\s*([\d.,]+)',           # Fallback, Le Creuset
-        r'Total\s*([\d.,]+)',               # General
-    ]
-    
-    vat_patterns = [
-        r'VAT\s*\(15%\)\s*R\s*([\d.,]+)',   # Amazon
-        r'Total VAT @ 15%\s*([\d.,]+)',     # Brights
-        r'VAT\s*15%\s*R\s*([\d.,]+)',       # Variations
-        r'VAT\s*R\s*([\d.,]+)',             # General
-        r'Tax\s*([\d.,]+)',                 # NATEC
-        r'Total VAT\s*([\d.,]+)',           # Fallback
-    ]
-    
-    def find_match(patterns):
-        for pat in patterns:
-            matches = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
-            if matches:
-                # Take the last/largest match as grand total/VAT
-                try:
-                    return float(matches[-1].replace(',', ''))
-                except:
-                    pass
-        return 0.0
-    
-    total = find_match(total_patterns)
-    vat = find_match(vat_patterns)
-    
-    # Improved fallback: Estimate VAT if no explicit but 15% or inclusive mentioned
-    if vat == 0 and total > 0 and ('15%' in text.lower() or 'incl' in text.lower() or 'vat' in text.lower()):
-        vat = round(total - (total / 1.15), 2)
-    
+def parse_invoice_with_ai(image):
+    if image is None:
+        return 0.0, 0.0
+
+    # Ask AI for total and VAT
+    total_resp = nlp(image, "What is the grand total?")
+    vat_resp = nlp(image, "What is the VAT amount?")
+
+    total = 0.0
+    vat = 0.0
+
+    try:
+        total = float(re.sub(r'[^\d.]', '', total_resp[0]['answer'])) if total_resp else 0.0
+    except:
+        pass
+
+    try:
+        vat = float(re.sub(r'[^\d.]', '', vat_resp[0]['answer'])) if vat_resp else 0.0
+    except:
+        pass
+
+    # Fallback if VAT not found
+    if vat == 0 and total > 0:
+        vat = round(total * 0.15 / 1.15, 2)
+
     return vat, total
 
 uploaded_files = st.file_uploader("Upload any number of PDFs or images", 
@@ -103,15 +94,15 @@ if uploaded_files:
     for i, up_file in enumerate(uploaded_files):
         progress.progress((i+1)/len(uploaded_files))
         file_bytes = up_file.read()
-        text = extract_text(file_bytes, up_file.name)
-        if not text:
-            results.append({"File": up_file.name, "VAT (R)": 0.0, "Total (R)": 0.0, "Status": "OCR failed"})
+        image = get_image_from_file(file_bytes, up_file.name)
+        if image is None:
+            results.append({"File": up_file.name, "VAT (R)": 0.0, "Total (R)": 0.0, "Status": "Processing failed"})
             continue
 
-        vat, amt = parse_invoice(text)
-        status = "OK" if amt > 0 else "Parse failed - check text"
+        vat, amt = parse_invoice_with_ai(image)
+        status = "OK" if amt > 0 else "AI parse failed"
 
-        results.append({"File": up_file.name, "VAT (R)": round(vat,2), "Total (R)": round(amt,2), "Status": status, "Extracted Text (snippet)": text[:200] + "..."})
+        results.append({"File": up_file.name, "VAT (R)": round(vat,2), "Total (R)": round(amt,2), "Status": status})
         total_vat += vat
         total_amount += amt
 
@@ -126,10 +117,11 @@ if uploaded_files:
     st.download_button("Download CSV", csv, "invoices_summary.csv", "text/csv")
 
 st.sidebar.info("""
-**Improvements:**
-- Better OCR preprocessing (sharper, less noise).
-- More regex patterns for your specific invoices.
-- Smarter VAT fallback for receipts like Le Creuset.
-- Shows text snippet for debugging.
-If still fails, run locally (streamlit run app.py) for faster testing.
+**Notes:**
+- Uses LayoutLM AI model locally (free, no key).
+- Handles scanned/digital PDFs/images.
+- First run may take time to download model (~500MB).
+- For multi-page PDFs, processes first page only.
+- Lowered DPI to 300 to prevent errors.
+- If VAT not detected, estimates at 15%.
 """)
