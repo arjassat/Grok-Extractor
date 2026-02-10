@@ -5,3 +5,5 @@ pytesseract
 Pillow
 opencv-python-headless
 pandas
+transformers
+torch
