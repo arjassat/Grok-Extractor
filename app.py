@@ -10,15 +10,17 @@ import tempfile
 import os
 import pandas as pd
 
-st.set_page_config(page_title="Offline Invoice VAT Extractor", layout="wide")
-st.title("🧾 Offline Invoice → VAT + Total Extractor")
-st.caption("100% local/offline: No API keys. Works on PDFs/images via OCR + heuristics.")
+st.set_page_config(page_title="Offline Invoice VAT Extractor v2", layout="wide")
+st.title("🧾 Offline Invoice → VAT + Total Extractor (Improved)")
+st.caption("100% local/offline: No API keys. Enhanced regex for your examples + better fallback.")
 
 def preprocess_image(img):
     img = img.convert("L")  # grayscale
     img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img = ImageEnhance.Contrast(img).enhance(2.0)  # Increased contrast
+    img = ImageEnhance.Sharpness(img).enhance(1.5)  # Added sharpness
     open_cv = np.array(img)
+    open_cv = cv2.medianBlur(open_cv, 3)  # Noise reduction
     open_cv = cv2.threshold(open_cv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     return Image.fromarray(open_cv)
 
@@ -36,44 +38,45 @@ def extract_text(file_bytes, filename):
                 page_text = page.extract_text() or ""
                 text += page_text + "\n"
             if len(text.strip()) < 50:  # Likely scanned PDF
-                images = convert_from_path(tmp_path, dpi=400, fmt="jpeg")
+                images = convert_from_path(tmp_path, dpi=500)  # Higher DPI for better OCR
                 for img in images:
                     proc = preprocess_image(img)
-                    text += pytesseract.image_to_string(proc, lang="eng") + "\n"
+                    text += pytesseract.image_to_string(proc, lang="eng", config='--psm 6') + "\n"  # PSM 6 for better layout
         else:  # image
             img = Image.open(tmp_path)
             proc = preprocess_image(img)
-            text = pytesseract.image_to_string(proc, lang="eng")
+            text = pytesseract.image_to_string(proc, lang="eng", config='--psm 6')
     finally:
         os.unlink(tmp_path)
     return text.strip()
 
 def parse_invoice(text):
-    # Heuristic regex patterns for South African invoices (R, 15% VAT)
-    # Total patterns
+    # Improved heuristic regex for South African invoices (based on your examples)
     total_patterns = [
-        r'Total Payable:\s*R\s*([\d.,]+)',  # e.g., Amazon
-        r'Total Amount\s*([\d.,]+)',        # e.g., Brights
-        r'Grand Total:\s*R\s*([\d.,]+)',    # General
+        r'Total Payable:\s*R\s*([\d.,]+)',  # Amazon
+        r'Total Amount\s*([\d.,]+)',        # Brights
+        r'Grand Total:\s*R\s*([\d.,]+)',    # NATEC/General
         r'Total Incl\s*([\d.,]+)',          # NATEC
-        r'Total\s*R\s*([\d.,]+)'            # Fallback
+        r'Total\s+R\s*([\d.,]+)',           # Fallback, Le Creuset
+        r'Total\s*([\d.,]+)',               # General
     ]
     
-    # VAT patterns
     vat_patterns = [
-        r'VAT\s*\(15%\)\s*R\s*([\d.,]+)',   # Explicit 15%
-        r'VAT\s*R\s*([\d.,]+)',             # General VAT
-        r'Tax\s*([\d.,]+)',                 # NATEC Tax
+        r'VAT\s*\(15%\)\s*R\s*([\d.,]+)',   # Amazon
         r'Total VAT @ 15%\s*([\d.,]+)',     # Brights
-        r'VAT 15%\s*R\s*([\d.,]+)'          # Variations
+        r'VAT\s*15%\s*R\s*([\d.,]+)',       # Variations
+        r'VAT\s*R\s*([\d.,]+)',             # General
+        r'Tax\s*([\d.,]+)',                 # NATEC
+        r'Total VAT\s*([\d.,]+)',           # Fallback
     ]
     
     def find_match(patterns):
         for pat in patterns:
-            match = re.search(pat, text, re.IGNORECASE | re.MULTILINE)
-            if match:
+            matches = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
+            if matches:
+                # Take the last/largest match as grand total/VAT
                 try:
-                    return float(match.group(1).replace(',', ''))
+                    return float(matches[-1].replace(',', ''))
                 except:
                     pass
         return 0.0
@@ -81,8 +84,8 @@ def parse_invoice(text):
     total = find_match(total_patterns)
     vat = find_match(vat_patterns)
     
-    # Fallback: If total found but no VAT, estimate VAT if 15% mentioned
-    if vat == 0 and total > 0 and '15%' in text.lower():
+    # Improved fallback: Estimate VAT if no explicit but 15% or inclusive mentioned
+    if vat == 0 and total > 0 and ('15%' in text.lower() or 'incl' in text.lower() or 'vat' in text.lower()):
         vat = round(total - (total / 1.15), 2)
     
     return vat, total
@@ -106,9 +109,9 @@ if uploaded_files:
             continue
 
         vat, amt = parse_invoice(text)
-        status = "OK" if amt > 0 else "Parse failed - add regex if needed"
+        status = "OK" if amt > 0 else "Parse failed - check text"
 
-        results.append({"File": up_file.name, "VAT (R)": round(vat,2), "Total (R)": round(amt,2), "Status": status})
+        results.append({"File": up_file.name, "VAT (R)": round(vat,2), "Total (R)": round(amt,2), "Status": status, "Extracted Text (snippet)": text[:200] + "..."})
         total_vat += vat
         total_amount += amt
 
@@ -123,9 +126,10 @@ if uploaded_files:
     st.download_button("Download CSV", csv, "invoices_summary.csv", "text/csv")
 
 st.sidebar.info("""
-**Tips:**
-- Pure offline: OCR + regex heuristics.
-- Accuracy ~80-95% on standard ZA invoices.
-- For custom formats, edit parse_invoice() regex in app.py.
-- Tested on your examples: Works for Amazon, NATEC, Brights, etc.
+**Improvements:**
+- Better OCR preprocessing (sharper, less noise).
+- More regex patterns for your specific invoices.
+- Smarter VAT fallback for receipts like Le Creuset.
+- Shows text snippet for debugging.
+If still fails, run locally (streamlit run app.py) for faster testing.
 """)
