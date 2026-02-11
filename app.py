@@ -6,11 +6,12 @@ import pandas as pd
 import re
 import numpy as np
 import cv2
+import io
 
 st.set_page_config(page_title="VAT Invoice Pro", layout="wide")
 
 st.title("📊 VAT Invoice Extractor PRO (Free Cloud Edition)")
-st.write("Mixed invoices (PDFs, scans, photos). Smart extraction with fallbacks.")
+st.write("Upload mixed invoices (PDFs, scans, photos). Smart extraction with validation + Excel export.")
 
 uploaded_files = st.file_uploader(
     "Upload invoices",
@@ -104,7 +105,7 @@ def extract_financials(text):
 
     return vat, total, excl, confidence
 
-# ---------------- MAIN ----------------
+# ---------------- MAIN PROCESSING ----------------
 
 if uploaded_files:
 
@@ -143,9 +144,10 @@ if uploaded_files:
     st.subheader("📄 Extracted Results")
     st.dataframe(df)
 
-    # FIX pandas warning + force numeric
+    # Ensure numeric columns
     df["VAT Amount"] = pd.to_numeric(df["VAT Amount"], errors="coerce")
     df["Total Incl VAT"] = pd.to_numeric(df["Total Incl VAT"], errors="coerce")
+    df["Total Excl VAT"] = pd.to_numeric(df["Total Excl VAT"], errors="coerce")
 
     total_vat = df["VAT Amount"].sum()
     total_amount = df["Total Incl VAT"].sum()
@@ -154,14 +156,30 @@ if uploaded_files:
     st.success(f"Total VAT: R {total_vat:,.2f}")
     st.success(f"Total Invoice Total: R {total_amount:,.2f}")
 
-    csv = df.to_csv(index=False).encode("utf-8")
+    # ---------------- EXCEL EXPORT ----------------
+
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="VAT Summary")
+
+        # Add summary sheet
+        summary_df = pd.DataFrame({
+            "Metric": ["Total VAT", "Total Invoice Total"],
+            "Amount": [total_vat, total_amount]
+        })
+
+        summary_df.to_excel(writer, index=False, sheet_name="Summary")
+
+    excel_data = output.getvalue()
 
     st.download_button(
-        "⬇ Download CSV",
-        csv,
-        "vat_invoice_summary.csv",
-        "text/csv"
+        label="⬇ Download Excel File",
+        data=excel_data,
+        file_name="vat_invoice_summary.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 else:
     st.info("Upload invoices to begin.")
+
