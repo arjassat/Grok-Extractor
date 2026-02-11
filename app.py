@@ -4,14 +4,13 @@ import pytesseract
 from PIL import Image
 import pandas as pd
 import re
-import io
 import numpy as np
 import cv2
 
 st.set_page_config(page_title="VAT Invoice Pro", layout="wide")
 
 st.title("📊 VAT Invoice Extractor PRO (Free Cloud Edition)")
-st.write("Upload mixed invoices (PDF, scans, photos). Smart extraction + validation.")
+st.write("Mixed invoices (PDFs, scans, photos). Smart extraction with fallbacks.")
 
 uploaded_files = st.file_uploader(
     "Upload invoices",
@@ -19,139 +18,103 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# ---------------------------
-# IMAGE ENHANCEMENT
-# ---------------------------
+# ---------------- IMAGE OCR ----------------
 
 def enhance_image(file):
     image = Image.open(file)
     img = np.array(image)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        11, 2
-    )
-    return thresh
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    return gray
 
 def extract_text_from_image(file):
     processed = enhance_image(file)
     return pytesseract.image_to_string(processed)
 
-# ---------------------------
-# PDF EXTRACTION
-# ---------------------------
+# ---------------- PDF EXTRACTION ----------------
 
 def extract_text_from_pdf(file):
     text = ""
     with pdfplumber.open(file) as pdf:
-        total_pages = len(pdf.pages)
-        for i, page in enumerate(pdf.pages):
+        for page in pdf.pages:
             page_text = page.extract_text()
             if page_text:
-                # Focus more on last 40% of document
-                if i >= total_pages * 0.6:
-                    text += page_text + "\n"
+                text += page_text + "\n"
     return text
 
-# ---------------------------
-# MONEY DETECTION
-# ---------------------------
+# ---------------- MONEY HELPERS ----------------
 
 def clean_amount(x):
     return float(x.replace(",", "").replace("R", "").strip())
 
-def extract_money_values(text):
-    matches = re.findall(r"\d[\d,]+\.\d{2}", text)
-    return [clean_amount(m) for m in matches]
+def find_money_strings(text):
+    return re.findall(r"\d[\d,]+\.\d{2}", text)
 
-# ---------------------------
-# CONTEXT SCORING ENGINE
-# ---------------------------
-
-def score_value(text, value_str):
-    score = 0
-    index = text.find(value_str)
-    if index == -1:
-        return score
-
-    window = text[max(0, index-100): index+100].lower()
-
-    if "vat" in window: score += 50
-    if "tax" in window: score += 40
-    if "total" in window: score += 30
-    if "incl" in window: score += 20
-    if "excl" in window: score += 20
-    if "amount due" in window: score += 25
-
-    return score
-
-# ---------------------------
-# SMART EXTRACTION
-# ---------------------------
+# ---------------- SMART EXTRACTION ----------------
 
 def extract_financials(text):
 
-    money_strings = re.findall(r"\d[\d,]+\.\d{2}", text)
+    money_strings = find_money_strings(text)
     money_values = [clean_amount(m) for m in money_strings]
 
     if not money_values:
         return None, None, None, 0
 
-    scored = []
+    text_lower = text.lower()
 
+    # --- VAT candidates ---
+    vat_candidates = []
     for m_str, m_val in zip(money_strings, money_values):
-        s = score_value(text, m_str)
-        scored.append((m_val, s))
+        idx = text_lower.find(m_str)
+        window = text_lower[max(0, idx-80):idx+80]
 
-    scored_sorted = sorted(scored, key=lambda x: x[1], reverse=True)
+        if any(k in window for k in ["vat", "tax", "15%"]):
+            vat_candidates.append(m_val)
 
     vat = None
-    total = None
-    excl = None
+    if vat_candidates:
+        vat = min(vat_candidates)  # VAT usually smaller than total
 
-    # Highest scored value assumed VAT candidate
-    if scored_sorted:
-        vat_candidate = scored_sorted[0][0]
-        vat = vat_candidate
-
-    # Assume largest value is total
+    # --- TOTAL ---
     total = max(money_values)
 
-    # Calculate excl if possible
-    if vat and total:
+    # --- EXCL ---
+    excl = None
+    if vat:
         excl = round(total - vat, 2)
 
-    # Mathematical validation
-    confidence = 50
+    # --- FALLBACK VAT ---
+    if not vat and total:
+        vat = round(total * 0.15 / 1.15, 2)
+        excl = round(total - vat, 2)
 
+    # --- CONFIDENCE ---
+    confidence = 40
     if vat and total:
-        calc_vat = round(total * 0.15 / 1.15, 2)
-        if abs(calc_vat - vat) < 2:
+        expected_vat = round(excl * 0.15, 2)
+        if abs(expected_vat - vat) < 3:
             confidence += 40
-
-    if excl and vat:
-        if abs((excl * 0.15) - vat) < 2:
+        else:
             confidence += 20
 
-    return vat, total, excl, min(confidence, 100)
+    if vat in money_values:
+        confidence += 10
 
-# ---------------------------
-# MAIN PROCESSING
-# ---------------------------
+    confidence = min(confidence, 100)
+
+    return vat, total, excl, confidence
+
+# ---------------- MAIN ----------------
 
 if uploaded_files:
 
     results = []
 
     for file in uploaded_files:
-
         try:
             if file.type == "application/pdf":
                 text = extract_text_from_pdf(file)
-                if not text.strip():
+                if len(text.strip()) < 20:
                     text = extract_text_from_image(file)
             else:
                 text = extract_text_from_image(file)
@@ -166,7 +129,7 @@ if uploaded_files:
                 "Confidence %": confidence
             })
 
-        except Exception as e:
+        except Exception:
             results.append({
                 "File Name": file.name,
                 "Total Excl VAT": None,
@@ -177,13 +140,17 @@ if uploaded_files:
 
     df = pd.DataFrame(results)
 
-    st.subheader("📄 Extracted Data")
+    st.subheader("📄 Extracted Results")
     st.dataframe(df)
 
-    total_vat = df["VAT Amount"].fillna(0).sum()
-    total_amount = df["Total Incl VAT"].fillna(0).sum()
+    # FIX pandas warning + force numeric
+    df["VAT Amount"] = pd.to_numeric(df["VAT Amount"], errors="coerce")
+    df["Total Incl VAT"] = pd.to_numeric(df["Total Incl VAT"], errors="coerce")
 
-    st.subheader("🧾 Summary Totals")
+    total_vat = df["VAT Amount"].sum()
+    total_amount = df["Total Incl VAT"].sum()
+
+    st.subheader("🧾 Totals")
     st.success(f"Total VAT: R {total_vat:,.2f}")
     st.success(f"Total Invoice Total: R {total_amount:,.2f}")
 
