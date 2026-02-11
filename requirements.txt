@@ -1,9 +1,6 @@
 streamlit
-pypdf
-pdf2image
+pdfplumber
 pytesseract
-Pillow
-opencv-python-headless
+pillow
 pandas
-transformers
-torch
+numpy
