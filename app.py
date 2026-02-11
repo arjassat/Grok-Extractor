@@ -1,127 +1,162 @@
 import streamlit as st
-from pypdf import PdfReader
-from pdf2image import convert_from_path
+import pdfplumber
 import pytesseract
-from PIL import Image, ImageOps, ImageEnhance
-import cv2
-import numpy as np
+from PIL import Image
 import re
-import tempfile
-import os
 import pandas as pd
-from transformers import pipeline
+import io
+import numpy as np
 
-# Disable decompression bomb check
-Image.MAX_IMAGE_PIXELS = None
+st.set_page_config(page_title="VAT Invoice Extractor", layout="wide")
 
-st.set_page_config(page_title="AI Invoice VAT Extractor", layout="wide")
-st.title("🧾 AI-Powered Invoice → VAT + Total Extractor")
-st.caption("Uses free local AI (LayoutLM) for extraction. No API keys. Works on PDFs/images.")
+st.title("📄 VAT Invoice Extractor (South Africa)")
+st.write("Upload PDF or Image invoices. The app will automatically extract VAT and Totals.")
 
-# Load AI model (caches after first load)
-@st.cache_resource
-def load_model():
-    return pipeline("document-question-answering", model="impira/layoutlm-document-qa")
+uploaded_files = st.file_uploader(
+    "Upload invoices (PDF, JPG, PNG)",
+    type=["pdf", "jpg", "jpeg", "png"],
+    accept_multiple_files=True
+)
 
-nlp = load_model()
+# -------------------------------
+# TEXT EXTRACTION
+# -------------------------------
 
-def preprocess_image(img):
-    img = img.convert("L")
-    img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Contrast(img).enhance(2.0)
-    img = ImageEnhance.Sharpness(img).enhance(1.5)
-    open_cv = np.array(img)
-    open_cv = cv2.medianBlur(open_cv, 3)
-    open_cv = cv2.threshold(open_cv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    return Image.fromarray(open_cv)
+def extract_text_from_pdf(file):
+    text = ""
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+    return text
 
-def get_image_from_file(file_bytes, filename):
-    suffix = os.path.splitext(filename)[1].lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(file_bytes)
-        tmp_path = tmp.name
+def extract_text_from_image(file):
+    image = Image.open(file)
+    image = image.convert("L")
+    return pytesseract.image_to_string(image)
 
-    image = None
-    try:
-        if suffix == ".pdf":
-            # Convert PDF to image (first page only to avoid large files)
-            images = convert_from_path(tmp_path, dpi=300, first_page=1, last_page=1)
-            image = preprocess_image(images[0])
-        else:
-            img = Image.open(tmp_path)
-            image = preprocess_image(img)
-    finally:
-        os.unlink(tmp_path)
-    return image
+# -------------------------------
+# SMART VAT + TOTAL DETECTION
+# -------------------------------
 
-def parse_invoice_with_ai(image):
-    if image is None:
-        return 0.0, 0.0
+def clean_amount(value):
+    value = value.replace(",", "").replace("R", "").strip()
+    return float(value)
 
-    # Ask AI for total and VAT
-    total_resp = nlp(image, "What is the grand total?")
-    vat_resp = nlp(image, "What is the VAT amount?")
+def find_largest_amount(text):
+    numbers = re.findall(r"\d[\d,]+\.\d{2}", text)
+    if numbers:
+        numbers = [clean_amount(n) for n in numbers]
+        return max(numbers)
+    return None
 
-    total = 0.0
-    vat = 0.0
+def extract_vat_and_totals(text):
 
-    try:
-        total = float(re.sub(r'[^\d.]', '', total_resp[0]['answer'])) if total_resp else 0.0
-    except:
-        pass
+    vat = None
+    total = None
+    excl = None
 
-    try:
-        vat = float(re.sub(r'[^\d.]', '', vat_resp[0]['answer'])) if vat_resp else 0.0
-    except:
-        pass
+    # VAT patterns
+    vat_patterns = [
+        r"VAT.*?(\d[\d,]+\.\d{2})",
+        r"Tax.*?(\d[\d,]+\.\d{2})",
+        r"15%.*?(\d[\d,]+\.\d{2})"
+    ]
 
-    # Fallback if VAT not found
-    if vat == 0 and total > 0:
+    # Total patterns
+    total_patterns = [
+        r"Total incl.*?(\d[\d,]+\.\d{2})",
+        r"Total amount.*?(\d[\d,]+\.\d{2})",
+        r"Total.*?(\d[\d,]+\.\d{2})"
+    ]
+
+    # Excluding VAT
+    excl_patterns = [
+        r"Total excl.*?(\d[\d,]+\.\d{2})",
+        r"Excl.*?(\d[\d,]+\.\d{2})"
+    ]
+
+    # Find VAT
+    for pattern in vat_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            vat = clean_amount(match.group(1))
+            break
+
+    # Find Excl
+    for pattern in excl_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            excl = clean_amount(match.group(1))
+            break
+
+    # Find Total
+    for pattern in total_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            total = clean_amount(match.group(1))
+            break
+
+    # If no total found → assume largest number is total
+    if not total:
+        total = find_largest_amount(text)
+
+    # If VAT missing but total & excl exist → calculate
+    if not vat and total and excl:
+        vat = round(total - excl, 2)
+
+    # If VAT still missing but total exists → assume 15%
+    if not vat and total:
         vat = round(total * 0.15 / 1.15, 2)
 
-    return vat, total
+    return vat, total, excl
 
-uploaded_files = st.file_uploader("Upload any number of PDFs or images", 
-                                  type=["pdf","png","jpg","jpeg"], 
-                                  accept_multiple_files=True)
+
+# -------------------------------
+# MAIN PROCESSING
+# -------------------------------
 
 if uploaded_files:
+
     results = []
-    total_vat = 0.0
-    total_amount = 0.0
-    progress = st.progress(0)
 
-    for i, up_file in enumerate(uploaded_files):
-        progress.progress((i+1)/len(uploaded_files))
-        file_bytes = up_file.read()
-        image = get_image_from_file(file_bytes, up_file.name)
-        if image is None:
-            results.append({"File": up_file.name, "VAT (R)": 0.0, "Total (R)": 0.0, "Status": "Processing failed"})
-            continue
+    for file in uploaded_files:
 
-        vat, amt = parse_invoice_with_ai(image)
-        status = "OK" if amt > 0 else "AI parse failed"
+        if file.type == "application/pdf":
+            text = extract_text_from_pdf(file)
+        else:
+            text = extract_text_from_image(file)
 
-        results.append({"File": up_file.name, "VAT (R)": round(vat,2), "Total (R)": round(amt,2), "Status": status})
-        total_vat += vat
-        total_amount += amt
+        vat, total, excl = extract_vat_and_totals(text)
+
+        results.append({
+            "File Name": file.name,
+            "Total Excl VAT": excl,
+            "VAT Amount": vat,
+            "Total Incl VAT": total
+        })
 
     df = pd.DataFrame(results)
-    st.dataframe(df, use_container_width=True)
 
-    col1, col2 = st.columns(2)
-    col1.metric("**Grand Total Amount**", f"R {total_amount:,.2f}")
-    col2.metric("**Grand Total VAT**", f"R {total_vat:,.2f}")
+    st.subheader("📊 Extracted Data Preview")
+    st.dataframe(df)
 
-    csv = df.to_csv(index=False).encode()
-    st.download_button("Download CSV", csv, "invoices_summary.csv", "text/csv")
+    total_vat = df["VAT Amount"].fillna(0).sum()
+    total_amount = df["Total Incl VAT"].fillna(0).sum()
 
-st.sidebar.info("""
-**Notes:**
-- Uses LayoutLM AI model locally (free, no key).
-- Handles scanned/digital PDFs/images.
-- First run may take time to download model (~500MB).
-- For multi-page PDFs, processes first page only.
-- Lowered DPI to 300 to prevent errors.
-- If VAT not detected, estimates at 15%.
-""")
+    st.subheader("🧾 Totals Summary")
+    st.success(f"Total VAT: R {total_vat:,.2f}")
+    st.success(f"Total Invoice Amount: R {total_amount:,.2f}")
+
+    csv = df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        "⬇ Download Results as CSV",
+        csv,
+        "vat_summary.csv",
+        "text/csv"
+    )
+
+else:
+    st.info("Upload invoices above to begin.")
